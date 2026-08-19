@@ -1,0 +1,36 @@
+# Vídeos: tanto los de entrada como las copias anotadas, ~10 MB cada una.
+*.mp4
+*.mov
+*.avi
+*.webm
+*.mkv
+
+# Modelos de pose: los baja descargar_modelo() la primera vez (5-30 MB).
+models/
+*.task
+
+# Salidas y cachés del análisis: se regeneran volviendo a ejecutar.
+out/
+out_*/
+**/data/cache/
+.gradio/
+flagged/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.env
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Editor y sistema
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
