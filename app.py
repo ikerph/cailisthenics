@@ -17,6 +17,7 @@ matplotlib.use("Agg")  # sin ventana: esto corre en un servidor
 import matplotlib.pyplot as plt
 
 from contador import Resultado, contar, dibujar
+from servidor.api import app as fastapi_app
 
 VERDE, ROJO, AZUL, NARANJA, GRIS = "#16a34a", "#dc2626", "#2563eb", "#ea580c", "#94a3b8"
 
@@ -149,5 +150,10 @@ def construir() -> gr.Blocks:
     return demo
 
 
+demo = construir()
+app = gr.mount_gradio_app(fastapi_app, demo, path="/web")
+
+
 if __name__ == "__main__":
-    construir().launch(share=True)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7860)

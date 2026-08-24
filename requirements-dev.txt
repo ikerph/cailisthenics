@@ -1,0 +1,5 @@
+# Tests y experimentos.
+-r requirements-servidor.txt
+pytest>=8.0
+httpx>=0.27          # TestClient de FastAPI
+matplotlib>=3.8      # solo las gráficas de experimentos/fase0_paso.py

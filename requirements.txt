@@ -1,0 +1,6 @@
+mediapipe>=0.10.13
+opencv-python>=4.9
+numpy>=1.26
+scipy>=1.11
+gradio>=4.0
+imageio-ffmpeg>=0.5   # ffmpeg propio con libx264: el vídeo anotado sale en H.264/MP4

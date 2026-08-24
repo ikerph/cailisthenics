@@ -34,3 +34,14 @@ env/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Experimentos: salidas, cachés de pose y gráficas. Se regeneran ejecutando.
+resultados/
+
+# El APK compilado: se regenera con flutter build apk.
+*.apk
+
+# Basura de herramientas: no va al repositorio.
+cloudflared.exe
+.flutter_url
+cai-servidor.tar.gz

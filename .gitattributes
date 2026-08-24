@@ -1,0 +1,11 @@
+# `core.autocrlf` está en true en este equipo, así que Windows convierte a CRLF
+# al sacar los ficheros. En un script de shell eso es fatal: bash intenta
+# ejecutar el retorno de carro y falla con un "$'\r': command not found" que no
+# dice nada de lo que pasa. Estos ficheros van en LF siempre, los saque quien
+# los saque.
+*.sh text eol=lf
+
+# El DDL lo lee tanto Python en Windows como sqflite en Android: mejor un solo
+# formato, y así la comparación byte a byte entre esquema/ y los assets del
+# cliente no depende del sistema en que se clonó.
+*.sql text eol=lf

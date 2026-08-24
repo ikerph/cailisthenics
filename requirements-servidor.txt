@@ -1,0 +1,19 @@
+# FASE 2 - backend.
+#
+# Autocontenido a propósito: NO hereda de requirements.txt. Ese fichero es lo
+# que necesita la demo de Gradio, y encadenarlos metía gradio -unos 200 MB- en
+# la imagen del servidor, que no lo usa para nada.
+
+# Visión y señal: lo que de verdad hace el trabajo.
+mediapipe>=0.10.13
+opencv-python-headless>=4.9   # headless: en un servidor no hay pantalla que abrir
+numpy>=1.26
+scipy>=1.11
+
+# Vídeo anotado. ffmpeg propio con libx264, sin instalar nada en el sistema.
+imageio-ffmpeg>=0.5
+
+# API
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9   # subida multipart: FastAPI no la trae de serie

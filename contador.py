@@ -5,90 +5,80 @@ VER 0.1
 Cuenta dominadas en un vídeo y dice cuántas son válidas.
 
     vídeo -> pose (nariz, hombros, muñecas)
-          -> altura de la nariz en anchuras de hombros
+          -> altura de la nariz en anchuras de hombros respecto a un "suelo" medido
+          con el percetil 5 de la ampitud de altura de la nariz durante el ejercicio
           -> picos por prominencia = repeticiones
           -> las que pasan la barra = válidas
 
 Se sigue la nariz porque arriba la barra tapa la barbilla, y se mide en anchuras
-de hombros para que el mismo umbral valga en 4K y en 480p. La barra es la recta
+de hombros para que el mismo umbral valga en diferentes resoluciones. La barra es la recta
 que une las dos muñecas: las manos están agarradas a ella.
 """
 
+# Anotaciones tipadas estilo Java tipo: funcion(nombre:str, apellido:str) -> Usuario
 from __future__ import annotations
 
-import shutil
+import shutil 
 import subprocess
 import urllib.request
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-
 import cv2
 import numpy as np
+
+# Filtrado y tratamiento de la señal
 from scipy.signal import butter, filtfilt, find_peaks
 
+# Mediapipe
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
+
+# Declaro las funciones que se van a emplear desde la APP (API Pública)
 __all__ = ["Repeticion", "Resultado", "contar", "dibujar"]
 
 # Índices de MediaPipe Pose (Mediapipe KEYPOINTS).
 NARIZ, HOMBRO_IZQ, HOMBRO_DER, MUNECA_IZQ, MUNECA_DER = 0, 11, 12, 15, 16
 
-MODELO = "lite"
-"""El modelo de pose. Se elige el ligero porque tarda una quinta parte que
-``heavy``, y eso es lo que permite enseñar el resultado en directo en vez de
-hacer esperar dos minutos.
+MODELO_MEDIAPIPE = "lite"
 
-Tiene un coste conocido y no es el conteo: medido sobre los tres vídeos
-etiquetados, ``lite`` acierta el *número* de repeticiones igual que ``heavy``
-—3, 7 y 18 en los dos—, pero sitúa la nariz sistemáticamente entre 0,06 y 0,17
-anchuras de hombros más abajo respecto a la recta de las manos. No es ruido que
-el filtro quite: es un sesgo, y se come las repeticiones que pasaban la barra
-por poco. En ``fp.mp4``, el vídeo con repeticiones al límite, ``heavy`` da las
-5 válidas etiquetadas a mano y ``lite`` da 3.
-
-Para recuperar ese veredicto se cambia esta constante por ``"heavy"``. El
-intermedio (``"full"``) no sirve de nada: mismo sesgo y más lento."""
-
+# Localizo fichero "models" donde debería estar "pose_landmarker_lite.task"
 CARPETA_MODELOS = Path("models")
+
+# Url para descargar modelo lite de mediapipe en caso de que no lo esté
 MODELO_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
     "pose_landmarker_{nombre}/float16/1/pose_landmarker_{nombre}.task"
 )
 
 PASO = 2
-"""Se analiza uno de cada dos frames. Sale gratis: una dominada son 0,25-0,7 Hz
-y a 15 Hz de muestreo la señal sigue estando dos órdenes de magnitud por debajo
-del límite de Nyquist, así que con el mismo modelo el veredicto es idéntico en
-los tres vídeos —los márgenes se mueven menos de 0,05 anchuras de hombros— y va
-al doble de rápido.
+"""Se analiza uno de cada dos frames. Paso de 30FPS a 15FPS de F_s, suponiendo una dominada
+muy rápida de 1s ~ 1Hz aún estoy lejos de los F_NYQ de 7.5Hz que implica el submuestreo.
 
-No conviene subirlo sin bajar :data:`CORTE_HZ` a la vez: con ``PASO = 4`` el
-corte queda pegado a Nyquist y el filtro deja de filtrar, sin avisar de nada.
-
-El vídeo anotado se escribe entero igualmente, manteniendo el esqueleto en los
-frames saltados."""
+Mas adelante LOW-PASS FILTER A 3Hz, eliminar ruido de temblores, OJO con subir PASO
+"""
 
 MIN_VISIBILIDAD = 0.5
-"""Por debajo de esta confianza el keypoint se descarta: MediaPipe no deja
-vacíos los puntos ocluidos, se los inventa."""
+"""MIN Confianza de Mediapipe antes de extrapolar los keypoints"""
 
 DESFASE_MUNECA_BU = 0.20
-"""Cuánto queda la barra por encima del keypoint de muñeca, en anchuras de
-hombros: la mano la envuelve por arriba, así que el punto cae en el lado de
-abajo."""
+"""[bu] Distancia barra sobre keypoint muñeca"""
 
 MARGEN_BU = DESFASE_MUNECA_BU + 0.20
-"""Cuánto tiene que superar la nariz a la recta de las manos para dar la
-repetición por válida: el desfase de la muñeca más otros 0,20 porque la
-barbilla va por detrás de la nariz."""
+"""[bu] Distancia debe superar nariz sobre muñecas para repe válida, 0.2 de la barra o
+0.4 desde muñeca para asegurar chin over bar"""
 
 CORTE_HZ = 3.0
-"""Corte del filtro. Una dominada son 0,25-0,7 Hz; el resto es temblor del
-estimador de pose."""
+"""Corte del filtro las dominadas oscilan entre 0,25-0,7 Hz. Paso frecuencias
+infreiores a 3Hz, es imposible una dominada de 0.33s, bajo esto todo es ruido"""
 
 PROMINENCIA = 0.4
-"""Cuánto tiene que sobresalir un pico de sus valles para contar, como fracción
-del recorrido típico. Mirar la prominencia y no un umbral fijo es lo que evita
-contar cinco veces un temblor y dejar de contar a quien no extiende los brazos."""
+"""Cuánto tiene que sobresalir un pico de sus valles locales para contabilizar
+    NO IMPLICA VALIDEZ
+ - evito contar temblores
+ - puedo valorar los intentos aunque no sean válidos
+"""
 
 # Dataclass congelada, instancia inmutable
 # Al declarar dataclass me escribe solo el __init__, __repr__ y el __eq__
@@ -102,23 +92,26 @@ class Repeticion:
     hombros (bu). Positivo = la barbilla pasó la barra."""
 
     # Método que se lee como atributo
-    # repeticion.valida() -> true o false, según la propia instancia
+    # repeticion.esValida() -> true o false, según la propia instancia
     @property
-    def valida(self) -> bool:
-        return self.margen_bu > 0
+    def esValida(self) -> bool:
+        if self.margen_bu > 0:
+            return True
+        else:
+            return False
     """Si la nariz ha pasado el umbral de validez (distancia bu positiva) -> True"""
 
 
 @dataclass(frozen=True)
 class Resultado:
-    """El conteo, con los puntos por si se quiere dibujar el vídeo anotado."""
+    """Conteo de DOMINADAS con registro de los Puntos de Mediapipe"""
 
     repeticiones: list[Repeticion]
     puntos: np.ndarray = field(default_factory=lambda: np.empty((0, 33, 2)), repr=False)
     fps: float = 30.0
-    """Los fps del vídeo original, no los del análisis."""
-    paso: int = 1
-    """Cada cuántos frames del original hay una fila en ``puntos``."""
+    """FPS vídeo original"""
+    paso: int = 1 # Análisis de video sin cortar frames
+    """Cada cuántos frames del video original hay una fila en ``puntos``."""
     barra_y_px: float = float("nan")
     """Altura de la barra en la imagen, en píxeles."""
     altura: np.ndarray = field(default_factory=lambda: np.empty(0), repr=False)
@@ -136,18 +129,23 @@ class Resultado:
 
     @property
     def validas(self) -> int:
-        return sum(1 for r in self.repeticiones if r.valida)
+        """Cuántas de las repeticiones contadas pasaron el umbral de barbilla."""
+        cuenta = 0
+        for rep in self.repeticiones:
+            if rep.esValida:
+                cuenta += 1
+        return cuenta
 
 
 def contar(video: str | Path, progreso=None) -> Resultado:
     """Cuenta las dominadas de un vídeo.
 
-    No hay que decirle dónde empieza la serie: se queda con el tramo más largo
-    en que el sujeto está colgado de la barra.
+    Identifica el tramo más largo en que el sujeto está colgado 
+    de la barra para determinar el ejercicio.
 
     Args:
         video: ruta del vídeo.
-        progreso: se llama con la fracción de vídeo procesada, de 0 a 1.
+        progreso: fracción de vídeo procesada, de 0 a 1.
 
     Raises:
         ValueError: si ahí no hay nadie haciendo dominadas.
@@ -159,77 +157,105 @@ def contar(video: str | Path, progreso=None) -> Resultado:
 def contar_puntos(
     puntos: np.ndarray, detectado: np.ndarray, fps: float, paso: int = 1
 ) -> Resultado:
-    """El conteo propiamente dicho, sobre los puntos ya extraídos.
-
-    ``fps`` es el del vídeo original y ``paso`` cada cuántos frames suyos hay
-    una fila en ``puntos``, así que la señal va a ``fps / paso``: todo lo que
-    mide tiempo —el filtro, la duración mínima del tramo, los huecos— usa esa
-    frecuencia, y solo al escribir instantes se vuelve a segundos del original.
+    """Conteo sobre los puntos ya extraídos.
+    Señal va a ``fps / paso`` tanto el filtro, la duración mínima del tramo y 
+    los huecos usan esa frecuencia, al escribir instantes se vuelve a segundos 
+    del original.
     """
+    # FPS de mi señal
     fps_senal = fps / paso
+
+    # Inicio y Fin del ejercicio en (numero de frame)
+    inicio : int
+    fin : int
     inicio, fin = _tramo_colgado(puntos, detectado, fps_senal)
+
+    todos : np.ndarray
+    puntos : np.ndarray
     todos, puntos = puntos, puntos[inicio:fin]
 
-    anchuras = np.linalg.norm(puntos[:, HOMBRO_IZQ] - puntos[:, HOMBRO_DER], axis=1)
+    # Todos los frames del keypoint 11 y del 12 y sus dos coordenadas restados, saco [BU]
+    # Todo es to se hace respecto "puntos" que contempla sujeto colgado
+    # Con linalg hago resta euclidea sqrt(dx^2 + dy^2)
+    anchuras = np.linalg.norm(puntos[:, HOMBRO_IZQ,:] - puntos[:, HOMBRO_DER,:], axis=1)
+    # NaN handling
     anchuras = anchuras[np.isfinite(anchuras) & (anchuras > 0)]
-    if anchuras.size < 5:
-        raise ValueError("no se ven los hombros: sin ellos no hay regla de medir")
-    # Una sola escala para todo el vídeo: si se recalculase frame a frame, la
-    # regla de medir cambiaría de tamaño con el propio movimiento.
+
+    # Para establecer la regla de medir (1 BU) hago la mediana de todas las anchuras
+    # biacromiales una vez se ha colgado el sujeto
     escala = float(np.median(anchuras))
 
+    # Posición y manos, mediana de los puntos colgado de coord y de muñecas izq y der
+    # colapsan en un escalar y se establece coord "y" de las muñecas
     manos_y = float(
         np.nanmedian(np.concatenate([puntos[:, MUNECA_IZQ, 1], puntos[:, MUNECA_DER, 1]]))
     )
     if not np.isfinite(manos_y):
-        raise ValueError("no se ven las muñecas: no se puede situar la barra")
+        raise ValueError("no se ven las muñecas")
 
+    # Del tensor una vez colgado, saco la coordenada "y" del trackpoint NARIZ
+    # Con relleanar interpolo los NaN
     nariz_y = _rellenar(puntos[:, NARIZ, 1])
-    # y crece hacia abajo: el percentil 95 es lo más bajo que llegó la nariz, y
-    # es más robusto que el mínimo ante un frame suelto.
+
+    # Tengo el origen 0,0 arriba a la izquierda, por ende,
+    # "y" crece hacia abajo, el percentil 95 es lo más bajo que llegó la nariz y
+    # lo establezco como el 0 de mi señal, no pillo MIN directamente para no
+    # comerme frames basura, me quedo con el percetil
     suelo = float(np.percentile(nariz_y, 95))
+
+    # En primer lugar suelo - nariz_y para ver mi posición respecto al suelo
+    # de la dominada y la divido entre la escala para tener BU's.
+
+    # Filtrar me pasa bajas a 3Hz, evito temblor del keypoint
     altura = _filtrar((suelo - nariz_y) / escala, fps_senal)
 
+    # El recorrido es la amplitud pico a pico, comparo los percentiles 95 (arriba) y
+    # 5 (abajo) ~ 0. El recorrido es hasta donde sube la nariz sobre dead hang.
     recorrido = float(np.percentile(altura, 95) - np.percentile(altura, 5))
-    if recorrido < 0.30:
-        raise ValueError(
-            f"la nariz solo recorre {recorrido:.2f} anchuras de hombros: "
-            "ahí no hay dominadas"
-        )
 
-    # La barra y el umbral salen del mismo sitio —la recta de las manos, en la
-    # escala de la señal— y se separan solo en cuánto hay que superarla.
+    # Controlo antes de valorar si quiera un intento, 0.3 bu son unos 12cm, evito kipping
+    if recorrido < 0.30:
+        raise ValueError(f"la nariz solo recorre {recorrido:.2f} anchuras de hombros")
+
+    # La barra y el umbral salen de la recta de las manos, en la
+    # escala de la señal y se separan solo cuando hay que superarla.
     manos_bu = (suelo - manos_y) / escala
     umbral = manos_bu + MARGEN_BU
+    # Cada pico de la señal es una repetición contada. La prominencia mínima se
+    # escala con el recorrido del propio sujeto: no es un valor absoluto.
+    picos = _picos(altura, PROMINENCIA * recorrido)
+    repeticiones = [
+        Repeticion(
+            numero=numero,
+            instante_s=(inicio + pico) / fps_senal,
+            margen_bu=float(altura[pico] - umbral),
+        )
+        # pico: la muestra de la señal donde está el máximo.
+        # numero: 1, 2, 3...
+        for numero, pico in enumerate(picos, start=1)
+    ]
+
     return Resultado(
-        repeticiones=[
-            Repeticion(
-                numero=numero,
-                instante_s=(inicio + i) / fps_senal,
-                margen_bu=float(altura[i] - umbral),
-            )
-            for numero, i in enumerate(_picos(altura, PROMINENCIA * recorrido), start=1)
-        ],
+        repeticiones=repeticiones,
+        # El vídeo entero, no solo el tramo: dibujar necesita todos los frames.
         puntos=todos,
         fps=fps,
         paso=paso,
+        # La misma barra en los dos sistemas de coordenadas: píxeles para pintar
+        # sobre la imagen, bu para la gráfica de la señal.
         barra_y_px=manos_y - DESFASE_MUNECA_BU * escala,
-        altura=altura,
-        tiempo=(inicio + np.arange(altura.size)) / fps_senal,
         barra_bu=manos_bu + DESFASE_MUNECA_BU,
         umbral_bu=umbral,
+        # La señal y su eje de tiempos: las pruebas de por qué contó lo que contó.
+        altura=altura,
+        tiempo=(inicio + np.arange(altura.size)) / fps_senal,
     )
 
 
 def _tramo_colgado(puntos: np.ndarray, detectado: np.ndarray, fps: float) -> tuple[int, int]:
     """Frames ``[inicio, fin)`` del tramo más largo con el sujeto en la barra.
 
-    Está colgado mientras las dos muñecas queden por encima de los hombros: se
-    cumple durante toda la dominada —por muy alto que suba, los hombros nunca
-    pasan de las manos— y no se cumple andando hacia la barra. Los huecos de
-    menos de un segundo se unen para no partir la serie en cada repetición, pero
-    solo si en ellos se seguía viendo a la persona: si se pierde el track, puede
-    haber otro plano u otra persona.
+    Está colgado mientras las dos muñecas queden por encima de los hombros
     """
     munecas = _media_visible(puntos[:, [MUNECA_IZQ, MUNECA_DER], 1])
     hombros = _media_visible(puntos[:, [HOMBRO_IZQ, HOMBRO_DER], 1])
@@ -260,10 +286,10 @@ def _tramo_colgado(puntos: np.ndarray, detectado: np.ndarray, fps: float) -> tup
 
 
 def _media_visible(par: np.ndarray) -> np.ndarray:
-    """Media de los dos lados usando solo el que se vea; ``NaN`` si ninguno."""
+    """Media de los dos lados usando el que se vea, ``NaN`` si ninguno."""
     with warnings.catch_warnings():
         # Un frame sin ninguno de los dos lados avisa de "media de vacío" y
-        # devuelve NaN, que es justo lo que aquí hace falta.
+        # devuelve NaN
         warnings.simplefilter("ignore", RuntimeWarning)
         return np.nanmean(par, axis=1)
 
@@ -272,7 +298,7 @@ def _rellenar(valores: np.ndarray) -> np.ndarray:
     """Interpola los frames sin dato: el filtro no admite ``NaN``."""
     validos = np.isfinite(valores)
     if not validos.any():
-        raise ValueError("no se ve la nariz en ningún frame del tramo")
+        raise ValueError("no se ve la nariz en ningún frame")
     if validos.all():
         return valores
     indices = np.arange(valores.size)
@@ -307,8 +333,7 @@ def _picos(altura: np.ndarray, prominencia_minima: float) -> np.ndarray:
     return np.clip(indices - 1, 0, altura.size - 1)
 
 
-def descargar_modelo(nombre: str = MODELO) -> Path:
-    """Ruta del modelo de pose, bajándolo la primera vez (5-30 MB)."""
+def descargar_modelo(nombre: str = MODELO_MEDIAPIPE) -> Path:
     destino = CARPETA_MODELOS / f"pose_landmarker_{nombre}.task"
     if not destino.exists():
         destino.parent.mkdir(parents=True, exist_ok=True)
@@ -318,7 +343,7 @@ def descargar_modelo(nombre: str = MODELO) -> Path:
 
 
 def extraer_pose(
-    video: str | Path, progreso=None, modelo: str = MODELO, paso: int = PASO
+    video: str | Path, progreso=None, modelo: str = MODELO_MEDIAPIPE, paso: int = PASO
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Pasa el vídeo por MediaPipe: ``(puntos (n, 33, 2), detectado (n,), fps)``.
 
@@ -331,10 +356,7 @@ def extraer_pose(
     igual —es barato al lado de la pose— porque saltar buscando posición en un
     vídeo comprimido no es fiable.
     """
-    import mediapipe as mp
-    from mediapipe.tasks import python as mp_python
-    from mediapipe.tasks.python import vision
-
+    
     paso = max(int(paso), 1)
     ruta_modelo = descargar_modelo(modelo)
 
@@ -362,6 +384,7 @@ def extraer_pose(
             ok, imagen = captura.read()
             if not ok:
                 break
+            # Si quiero submuestrear, analizo frames según el PASO
             if indice % paso == 0:
                 marco = mp.Image(
                     image_format=mp.ImageFormat.SRGB,
@@ -519,7 +542,7 @@ def dibujar(
     escritor, ruta = _abrir_escritor(Path(destino), resultado.fps, ancho, alto)
 
     picos = [
-        (int(round(r.instante_s * resultado.fps)), r.valida) for r in resultado.repeticiones
+        (int(round(r.instante_s * resultado.fps)), r.esValida) for r in resultado.repeticiones
     ]
     try:
         indice = 0
@@ -532,7 +555,7 @@ def dibujar(
                 _dibujar_esqueleto(imagen, resultado.puntos[fila])
             _dibujar_barra(imagen, resultado.barra_y_px)
             hechas = sum(1 for pico, _ in picos if pico <= indice)
-            validas = sum(1 for pico, valida in picos if valida and pico <= indice)
+            validas = sum(1 for pico, esValida in picos if esValida and pico <= indice)
             # Sin tildes: las fuentes Hershey de OpenCV no tienen glifos acentuados.
             _dibujar_marcador(imagen, f"{hechas} realizadas  |  {validas} validas")
             escritor.write(imagen)
